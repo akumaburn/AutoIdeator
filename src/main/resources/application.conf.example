@@ -1,0 +1,168 @@
+autoideator {
+  llm {
+    # Backend: opencode-cli, claude-cli, custom-claude-cli, openrouter, mock
+    # Default is opencode-cli which works out of the box
+    backend = "opencode-cli"
+
+    # Model selection (backend-specific)
+    # For opencode-cli: glm-5 (default), or any model from zai-coding-plan/*
+    model = "glm-5"
+
+    # Timeout for LLM responses
+    timeout = 300s
+
+    openrouter {
+      api-key = ${?OPENROUTER_API_KEY}
+      base-url = "https://openrouter.ai/api/v1"
+      model = "anthropic/claude-3.5-sonnet"
+    }
+
+    claude-cli {
+      # Path to claude CLI (defaults to 'claude' in PATH)
+      path = "claude"
+      # Additional arguments
+      args = []
+    }
+
+    opencode-cli {
+      path = "opencode"
+      args = []
+    }
+
+    custom-claude-cli {
+      # Path to claude binary
+      path = "claude"
+      # Override API key (ANTHROPIC_API_KEY env var)
+      api-key = ${?ANTHROPIC_API_KEY}
+      # Override base URL (ANTHROPIC_BASE_URL env var)
+      base-url = "https://api.z.ai/api/anthropic"
+      # Override model (ANTHROPIC_MODEL env var + --model flag)
+      model = "glm-5"
+      # Override haiku model (ANTHROPIC_DEFAULT_HAIKU_MODEL env var)
+      haiku-model = "glm-4.5-air"
+      # Override sonnet model (ANTHROPIC_DEFAULT_SONNET_MODEL env var)
+      sonnet-model = "glm-4.7"
+      # Override opus model (ANTHROPIC_DEFAULT_OPUS_MODEL env var)
+      opus-model = "glm-5"
+      # Add --dangerously-skip-permissions to the spawned Claude CLI invocation.
+      # WARNING: this disables the CLI's permission prompts so file-edit and
+      # command-execution tool calls run without confirmation. Only enable this
+      # when running inside the bubblewrap sandbox (sandbox-enabled = true) or
+      # in a throwaway environment. Defaults to false to require explicit opt-in.
+      dangerously-skip-permissions = false
+      # Additional CLI arguments
+      args = []
+    }
+  }
+
+  orchestration {
+    # Number of plan refinement cycles (classic mode only)
+    plan-refinement-cycles = 12
+
+    # Maximum concurrent agents (affects parallel agent execution)
+    max-concurrent-agents = 10
+
+    # Maximum concurrent coders (limits parallel coder instances)
+    # Default is 5 to prevent resource exhaustion
+    max-concurrent-coders = 5
+
+    # Enable parallel agent execution
+    parallel-execution = true
+
+    # Commit interval (reserved for future use; not yet wired)
+    commit-interval = 5m
+
+    # Enable the Hacker (security) agent in the idea queue.
+    # Set to false if security analysis is not a concern for the target project.
+    hacker-enabled = true
+
+    # Enable bubblewrap (bwrap) sandbox for write isolation.
+    # When enabled, all agent CLI processes and git commands run inside a sandbox
+    # that only allows writes to the project working directory and /tmp.
+    # Requires bubblewrap to be installed (e.g., `pacman -S bubblewrap`).
+    # Falls back to unsandboxed execution if bwrap is not found.
+    sandbox-enabled = true
+
+    # Run the Synthesizer agent every N cycles to find synergies across recent work
+    synthesize-interval = 5
+
+    # Minimum goal alignment score (0-10) for ideas to proceed
+    min-goal-alignment = 6
+
+    # Minimum overall score (0-10) for ideas to proceed
+    min-overall-score = 5
+
+    # Per-agent weights for the idea queue round-robin.
+    # Higher weight = more slots in the rotation. All values must be >= 1.
+    # Default produces a 15-slot sequence: D, A, A, R, H, O*5, Adv*5
+    idea-queue-weights {
+      dreamer  = 1   # New feature ideas
+      artist   = 2   # Visual / UX improvements (gated by Maestro)
+      refiner  = 1   # Performance optimizations
+      hacker   = 1   # Security hardening
+      obsessor = 5   # Correctness gap analysis
+      advancer = 5   # Deepen existing features
+    }
+  }
+
+  self-improvement {
+    # Enable self-improvement cycle
+    # In director mode, the multi-agent loop is inherently self-improving;
+    # this setting controls the separate SelfImprovementEngine scan.
+    enabled = true
+
+    # Interval between improvement scans
+    scan-interval = 30m
+
+    # Maximum improvements per cycle
+    max-improvements-per-cycle = 5
+  }
+
+  # Classic mode agent settings (not used in Director mode)
+  agents {
+    planner {
+      enabled = true
+      max-iterations = 3
+    }
+
+    coder {
+      enabled = true
+      max-iterations = 2
+    }
+
+    reviewer {
+      enabled = true
+      max-iterations = 1
+    }
+
+    tester {
+      enabled = true
+      max-iterations = 1
+    }
+
+    git {
+      enabled = true
+      max-iterations = 1
+    }
+  }
+
+  git {
+    # Auto-commit after each major change
+    auto-commit = true
+
+    # Branch naming for improvements (reserved for future use; not yet wired)
+    improvement-branch-prefix = "improvement/"
+
+    # Commit message format
+    commit-format = "${prefix}: ${message}"
+  }
+
+  # Logging is configured via logback.xml at startup.
+  # These values are loaded but not applied at runtime.
+  logging {
+    level = "INFO"
+    file = "logs/autoideator.log"
+    max-size = 10
+    backup-count = 5
+  }
+}

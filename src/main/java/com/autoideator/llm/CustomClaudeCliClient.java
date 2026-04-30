@@ -1,0 +1,450 @@
+package com.autoideator.llm;
+
+import com.autoideator.ProcessManager;
+import com.autoideator.config.AutoIdeatorConfig;
+import com.autoideator.model.AgentResponse;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+
+import java.io.BufferedReader;
+import java.io.IOException;
+import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.Consumer;
+
+/**
+ * LLM interface using the Claude CLI with custom environment variable injection.
+ *
+ * <p>Wraps the {@code claude} binary in streaming JSON mode
+ * ({@code --print --output-format stream-json}) and injects environment variables
+ * into the subprocess: {@code ANTHROPIC_API_KEY}, {@code ANTHROPIC_BASE_URL},
+ * {@code ANTHROPIC_MODEL}, and the three {@code ANTHROPIC_DEFAULT_*_MODEL} overrides.
+ * This allows routing the Claude CLI through alternative API-compatible providers.
+ *
+ * <p>Each tool call, sub-agent spawn, and thinking step emits a JSON event on
+ * stdout, keeping the activity monitor alive during long agentic operations.
+ * The final result is extracted from the {@code "type":"result"} event.
+ *
+ * <p>The prompt is delivered via stdin to avoid OS argument-length limits.
+ * Stdout and stderr are read on parallel virtual threads to prevent pipe-buffer
+ * deadlock, and the process is bounded by a configurable timeout.
+ */
+public class CustomClaudeCliClient implements LlmInterface {
+
+    private static final Logger LOG = LoggerFactory.getLogger(CustomClaudeCliClient.class);
+    private static final ObjectMapper JSON = new ObjectMapper();
+    private static final long STALL_TIMEOUT_MS = 240_000; // 4 minutes
+
+    private final AutoIdeatorConfig config;
+    private final ExecutorService executor;
+
+    public CustomClaudeCliClient(AutoIdeatorConfig config) {
+        this.config = config;
+        Thread.UncaughtExceptionHandler handler = (thread, throwable) -> 
+            LOG.error("Uncaught exception in CustomClaudeCliClient virtual thread '{}': {}", 
+                thread.getName(), throwable.getMessage(), throwable);
+        this.executor = Executors.newThreadPerTaskExecutor(
+            Thread.ofVirtual()
+                .uncaughtExceptionHandler(handler)
+                .factory());
+        logConfiguration();
+    }
+
+    private void logConfiguration() {
+        AutoIdeatorConfig.CustomClaudeCliConfig cliCfg = config.llm().customClaudeCli();
+        LOG.info("Custom Claude CLI configuration:");
+        LOG.info("  path              = {}", cliCfg.path());
+        LOG.info("  ANTHROPIC_BASE_URL = {}", cliCfg.baseUrl());
+        LOG.info("  ANTHROPIC_MODEL    = {}", cliCfg.model());
+        LOG.info("  ANTHROPIC_DEFAULT_HAIKU_MODEL  = {}", cliCfg.haikuModel());
+        LOG.info("  ANTHROPIC_DEFAULT_SONNET_MODEL = {}", cliCfg.sonnetModel());
+        LOG.info("  ANTHROPIC_DEFAULT_OPUS_MODEL   = {}", cliCfg.opusModel());
+        LOG.info("  dangerouslySkipPermissions = {}", cliCfg.dangerouslySkipPermissions());
+        LOG.info("  ANTHROPIC_API_KEY  = {}", cliCfg.apiKey() != null ? "(set via config)" : "(not in config)");
+
+        // Warn if API key is not available from any source
+        if ((cliCfg.apiKey() == null || cliCfg.apiKey().isBlank())
+                && (System.getenv("ANTHROPIC_API_KEY") == null || System.getenv("ANTHROPIC_API_KEY").isBlank())) {
+            LOG.warn("ANTHROPIC_API_KEY is not set in config or environment — "
+                + "claude CLI may hang or fail waiting for authentication");
+        }
+    }
+
+    @Override
+    public CompletableFuture<AgentResponse> sendPrompt(String systemPrompt, String userPrompt) {
+        return CompletableFuture.supplyAsync(() -> executeClaude(systemPrompt, userPrompt, null), executor);
+    }
+
+    @Override
+    public CompletableFuture<AgentResponse> sendPrompt(String systemPrompt, String userPrompt, Consumer<String> onChunk) {
+        return CompletableFuture.supplyAsync(() -> executeClaude(systemPrompt, userPrompt, onChunk), executor);
+    }
+
+    @Override
+    public CompletableFuture<AgentResponse> sendPromptWithHistory(
+        String systemPrompt,
+        Iterable<Message> messages,
+        String userPrompt
+    ) {
+        StringBuilder fullPrompt = new StringBuilder();
+
+        if (systemPrompt != null && !systemPrompt.isBlank()) {
+            fullPrompt.append("System: ").append(systemPrompt).append("\n\n");
+        }
+
+        for (Message msg : messages) {
+            fullPrompt.append(msg.role()).append(": ").append(msg.content()).append("\n");
+        }
+
+        fullPrompt.append("user: ").append(userPrompt);
+
+        return sendPrompt(null, fullPrompt.toString());
+    }
+
+    private AgentResponse executeClaude(String systemPrompt, String userPrompt, Consumer<String> onChunk) {
+        long startTime = System.currentTimeMillis();
+        Process process = null;
+        Thread outputThread = null;
+        Thread errorThread = null;
+        Thread monitorThread = null;
+        AtomicLong lastActivityTime = new AtomicLong(System.currentTimeMillis());
+        AtomicBoolean outputStarted = new AtomicBoolean(false);
+        AtomicBoolean stalled = new AtomicBoolean(false);
+
+        try {
+            List<String> command = buildCommand();
+            String prompt = buildPrompt(systemPrompt, userPrompt);
+            LOG.debug("Executing Custom Claude CLI: {} (prompt via stdin, {} chars)",
+                String.join(" ", command), prompt.length());
+
+            if (config.orchestration().sandboxEnabled()
+                    && com.autoideator.sandbox.BubblewrapSandbox.isAvailable()) {
+                // Claude CLI needs write access to ~/.claude for session state and logs
+                java.nio.file.Path claudeDir = java.nio.file.Path.of(
+                    System.getProperty("user.home"), ".claude");
+                command = new java.util.ArrayList<>(
+                    com.autoideator.sandbox.BubblewrapSandbox.wrapCommand(
+                        command, config.workingDir(), claudeDir));
+                LOG.debug("Sandbox enabled — command wrapped with bwrap");
+            }
+
+            ProcessBuilder pb = new ProcessBuilder(command);
+            pb.redirectErrorStream(false);
+
+            LOG.debug("Injecting environment variables:");
+            injectEnvVars(pb.environment());
+
+            if (config.workingDir() != null) {
+                pb.directory(config.workingDir().toFile());
+            }
+
+            process = pb.start();
+            ProcessManager.getInstance().register(process);
+
+            // Write prompt via stdin
+            try (var os = process.getOutputStream()) {
+                os.write(prompt.getBytes(StandardCharsets.UTF_8));
+                os.write('\n');
+                os.flush();
+            }
+
+            final Process finalProcess = process;
+            StringBuffer outputBuilder = new StringBuffer();
+            StringBuffer errorBuilder = new StringBuffer();
+            AtomicReference<String> parsedResult = new AtomicReference<>(null);
+            StringBuffer salvageBuffer = new StringBuffer();
+
+            outputThread = Thread.startVirtualThread(() -> {
+                ClaudeStreamParser streamParser = new ClaudeStreamParser();
+                // Wrap onChunk to accumulate streamed text for salvage on crash
+                Consumer<String> streamConsumer = chunk -> {
+                    salvageBuffer.append(chunk);
+                    CliProcessUtils.capBuffer(salvageBuffer, CliProcessUtils.MAX_SALVAGE_BUFFER_CHARS);
+                    if (onChunk != null) {
+                        try { onChunk.accept(chunk); } catch (Exception ignored) {}
+                    }
+                };
+                try (BufferedReader reader = finalProcess.inputReader(StandardCharsets.UTF_8)) {
+                    String line;
+                    while ((line = reader.readLine()) != null) {
+                        outputBuilder.append(line).append("\n");
+                        CliProcessUtils.capBuffer(outputBuilder, CliProcessUtils.MAX_OUTPUT_BUFFER_CHARS);
+                        outputStarted.set(true);
+                        lastActivityTime.set(System.currentTimeMillis());
+                        try {
+                            JsonNode event = JSON.readTree(line);
+                            String eventType = event.path("type").asText();
+                            if ("result".equals(eventType)) {
+                                JsonNode resultNode = event.path("result");
+                                if (resultNode.isTextual()) {
+                                    parsedResult.set(resultNode.asText());
+                                }
+                            }
+                            // Always stream for salvage; forwards to onChunk if non-null
+                            streamParser.processEvent(event, eventType, streamConsumer);
+                        } catch (com.fasterxml.jackson.core.JsonProcessingException e) {
+                            // Non-JSON line — stream it raw
+                            if (!line.isBlank()) {
+                                try { streamConsumer.accept(line + "\n"); } catch (Exception ignored) {}
+                            }
+                        } catch (Exception e) {
+                            LOG.trace("Unexpected error parsing line: {}", e.getMessage());
+                        }
+                    }
+                } catch (IOException e) {
+                    LOG.debug("Error reading stdout: {}", e.getMessage());
+                }
+            });
+
+            errorThread = Thread.startVirtualThread(() -> {
+                try (BufferedReader reader = finalProcess.errorReader(StandardCharsets.UTF_8)) {
+                    String line;
+                    while ((line = reader.readLine()) != null) {
+                        errorBuilder.append(line).append("\n");
+                        CliProcessUtils.capBuffer(errorBuilder, CliProcessUtils.MAX_ERROR_BUFFER_CHARS);
+                        outputStarted.set(true);
+                        lastActivityTime.set(System.currentTimeMillis());
+                    }
+                } catch (IOException e) {
+                    LOG.debug("Error reading stderr: {}", e.getMessage());
+                }
+            });
+
+            // Measure baseline AFTER reader threads are running (avoids pipe-buffer deadlock during 2s sleep)
+            long baselineDescendants = CliProcessUtils.measureBaselineDescendants(process);
+
+            // Monitor thread — tool-aware stall detection
+            AtomicBoolean shouldStop = new AtomicBoolean(false);
+            monitorThread = CliProcessUtils.startMonitorThread(
+                process, STALL_TIMEOUT_MS, lastActivityTime, outputStarted,
+                stalled, shouldStop, baselineDescendants, "Custom Claude CLI");
+
+            // Tool-aware wait — extends deadline while tool subprocesses are active
+            long timeoutMs = config.llm().timeout() != null
+                ? config.llm().timeout().toMillis() : 300_000;
+            boolean completed = CliProcessUtils.waitForWithToolAwareness(
+                process, timeoutMs, lastActivityTime, baselineDescendants, "Custom Claude CLI");
+            shouldStop.set(true);
+            if (monitorThread != null) monitorThread.interrupt();
+
+            if (stalled.get()) {
+                process.destroyForcibly();
+                waitForProcessDeath(process, 2000);
+                joinThread(outputThread, 5000);
+                joinThread(errorThread, 5000);
+                joinThread(monitorThread, 1000);
+                LOG.error("Custom Claude CLI stalled — no output for {} seconds (no active tool processes)",
+                    STALL_TIMEOUT_MS / 1000);
+                return AgentResponse.failure(
+                    "Custom Claude CLI stalled — no output received for " + (STALL_TIMEOUT_MS / 1000) + " seconds");
+            }
+
+            if (!completed) {
+                process.destroyForcibly();
+                waitForProcessDeath(process, 2000);
+            }
+
+            joinThread(outputThread, 5000);
+            joinThread(errorThread, 5000);
+            joinThread(monitorThread, 1000);
+
+            long duration = System.currentTimeMillis() - startTime;
+            String output = outputBuilder.toString().trim();
+            String error = errorBuilder.toString().trim();
+
+            if (!completed) {
+                LOG.error("Custom Claude CLI timed out after {}ms (tool-aware). stderr: {}", timeoutMs, error);
+                return AgentResponse.failure("Custom Claude CLI timed out"
+                    + (error.isBlank() ? "" : ". stderr: " + error));
+            }
+
+            int exitCode = process.exitValue();
+            if (exitCode == 0) {
+                String result = parsedResult.get();
+                if (result != null && !result.isBlank()) {
+                    LOG.debug("Custom Claude CLI completed in {}ms (stream-json)", duration);
+                    return AgentResponse.success(result, 0, duration);
+                } else if (!output.isBlank()) {
+                    LOG.debug("Custom Claude CLI completed in {}ms (raw output fallback)", duration);
+                    return AgentResponse.success(output, 0, duration);
+                } else {
+                    LOG.error("Custom Claude CLI exit 0 but produced no output");
+                    return AgentResponse.failure("Custom Claude CLI produced no output");
+                }
+            } else {
+                // Salvage partial output — the agent may have done useful work
+                // (tool calls, analysis) before the API/CLI crashed
+                String salvaged = salvageBuffer.toString().trim();
+                if (salvaged.length() > 200) {
+                    LOG.warn("Custom Claude CLI exited with code {} but produced {} chars of streamed output — salvaging partial result",
+                        exitCode, salvaged.length());
+                    return AgentResponse.success(salvaged, 0, duration);
+                }
+                String cleanError = CliProcessUtils.stripAnsi(error);
+                String cleanOutput = CliProcessUtils.stripAnsi(output);
+                String errorDetail = !cleanError.isBlank() ? cleanError
+                    : (!cleanOutput.isBlank() ? cleanOutput : "exit code " + exitCode);
+                LOG.error("Custom Claude CLI failed with exit code {}: {}", exitCode, errorDetail);
+                String fullCaptured = CliProcessUtils.buildFailureOutput("Custom Claude CLI", cleanOutput, cleanError, exitCode);
+                return AgentResponse.failureWithOutput("Custom Claude CLI failed: " + errorDetail, fullCaptured);
+            }
+        } catch (IOException e) {
+            LOG.error("Failed to execute Custom Claude CLI. Is '{}' in PATH?",
+                config.llm().customClaudeCli().path(), e);
+            return AgentResponse.failure("Failed to execute Custom Claude CLI: " + e.getMessage());
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return AgentResponse.failure("Custom Claude CLI interrupted");
+        } finally {
+            if (process != null) {
+                if (process.isAlive()) {
+                    process.destroyForcibly();
+                    waitForProcessDeath(process, 2000);
+                }
+                ProcessManager.getInstance().unregister(process);
+            }
+            joinThread(outputThread, 1000);
+            joinThread(errorThread, 1000);
+            joinThread(monitorThread, 1000);
+        }
+    }
+
+    /**
+     * Wait for a process to fully terminate after destroyForcibly() is called.
+     */
+    private void waitForProcessDeath(Process process, long timeoutMs) {
+        if (process == null || !process.isAlive()) {
+            return;
+        }
+        try {
+            if (!process.waitFor(timeoutMs, TimeUnit.MILLISECONDS)) {
+                LOG.warn("Custom Claude CLI process {} did not terminate within {}ms", process.pid(), timeoutMs);
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            process.destroyForcibly();
+        }
+    }
+
+    private List<String> buildCommand() {
+        AutoIdeatorConfig.CustomClaudeCliConfig cliCfg = config.llm().customClaudeCli();
+        List<String> command = new ArrayList<>();
+        command.add(cliCfg.path());
+
+        if (cliCfg.dangerouslySkipPermissions()) {
+            command.add("--dangerously-skip-permissions");
+        }
+
+        if (cliCfg.model() != null && !cliCfg.model().isBlank()) {
+            command.add("--model");
+            command.add(cliCfg.model());
+        }
+
+        for (String arg : cliCfg.args()) {
+            command.add(arg);
+        }
+
+        // --print enables headless mode; --verbose + stream-json emits an event
+        // per tool call / sub-agent / thinking step so the activity monitor stays alive.
+        command.add("--print");
+        command.add("--verbose");
+        command.add("--output-format");
+        command.add("stream-json");
+
+        return command;
+    }
+
+    private String buildPrompt(String systemPrompt, String userPrompt) {
+        StringBuilder prompt = new StringBuilder();
+        if (systemPrompt != null && !systemPrompt.isBlank()) {
+            prompt.append(systemPrompt).append("\n\n");
+        }
+        prompt.append(userPrompt);
+        return prompt.toString();
+    }
+
+    private void injectEnvVars(Map<String, String> env) {
+        AutoIdeatorConfig.CustomClaudeCliConfig cliCfg = config.llm().customClaudeCli();
+
+        setEnvIfPresent(env, "ANTHROPIC_API_KEY", cliCfg.apiKey());
+        setEnvIfPresent(env, "ANTHROPIC_BASE_URL", cliCfg.baseUrl());
+        setEnvIfPresent(env, "ANTHROPIC_MODEL", cliCfg.model());
+        setEnvIfPresent(env, "ANTHROPIC_DEFAULT_HAIKU_MODEL", cliCfg.haikuModel());
+        setEnvIfPresent(env, "ANTHROPIC_DEFAULT_SONNET_MODEL", cliCfg.sonnetModel());
+        setEnvIfPresent(env, "ANTHROPIC_DEFAULT_OPUS_MODEL", cliCfg.opusModel());
+    }
+
+    private void setEnvIfPresent(Map<String, String> env, String key, String value) {
+        if (value != null && !value.isBlank()) {
+            env.put(key, value);
+            if (key.contains("KEY")) {
+                LOG.info("  {} = ****", key);
+            } else {
+                LOG.info("  {} = {}", key, value);
+            }
+        } else {
+            // Log effective value from parent environment
+            String inherited = env.get(key);
+            if (inherited != null && !inherited.isBlank()) {
+                LOG.info("  {} = (inherited from environment)", key);
+            }
+        }
+    }
+
+    private void joinThread(Thread thread, long timeoutMs) {
+        CliProcessUtils.joinThread(thread, timeoutMs);
+    }
+
+    @Override
+    public String getBackendName() {
+        return "Custom Claude CLI";
+    }
+
+    @Override
+    public boolean isAvailable() {
+        Process process = null;
+        try {
+            String path = config.llm().customClaudeCli().path();
+            ProcessBuilder pb = new ProcessBuilder(path, "--version");
+            pb.redirectOutput(ProcessBuilder.Redirect.DISCARD);
+            pb.redirectErrorStream(true);
+            injectEnvVars(pb.environment());
+            process = pb.start();
+            boolean completed = process.waitFor(10, TimeUnit.SECONDS);
+            if (!completed) {
+                process.destroyForcibly();
+                return false;
+            }
+            return process.exitValue() == 0;
+        } catch (Exception e) {
+            if (process != null && process.isAlive()) process.destroyForcibly();
+            LOG.warn("Custom Claude CLI not available: {}", e.getMessage());
+            return false;
+        }
+    }
+
+    @Override
+    public void close() {
+        executor.shutdown();
+        try {
+            if (!executor.awaitTermination(10, TimeUnit.SECONDS)) {
+                executor.shutdownNow();
+            }
+        } catch (InterruptedException e) {
+            executor.shutdownNow();
+            Thread.currentThread().interrupt();
+        }
+    }
+}
