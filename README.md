@@ -2,6 +2,8 @@
 
 A self-improving AI orchestration agent that takes a detailed description of your finished project — what *done* looks like, with no implementation steps or phasing — and works toward making it real through coordinated agent swarms with intelligent quality control, strategic planning, and systematic goal verification.
 
+![AutoIdeator dashboard mid-run — cycle 21, three coders active, every prior phase showing its per-cycle status. Full walkthrough in docs/USAGE.md.](docs/images/dashboard.png)
+
 ## Overview
 
 AutoIdeator is an autonomous development system that:
