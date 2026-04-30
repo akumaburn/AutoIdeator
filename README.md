@@ -325,6 +325,8 @@ Original planner-coder-reviewer workflow with iterative plan refinement. Uses Pl
 
 ## Quick Start
 
+> **New here?** Read [docs/USAGE.md](docs/USAGE.md) first — it walks an empty machine all the way to a running cycle (prerequisites, picking and authenticating an LLM backend, dashboard tour with screenshot, common pitfalls). The rest of this section is the short form.
+
 ### Using the Web Dashboard (Recommended)
 
 ```bash
