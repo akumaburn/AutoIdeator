@@ -315,7 +315,7 @@ public class ClaudeCliClient implements LlmInterface {
 
         // Add model if explicitly configured and not the default opencode-cli model
         String model = config.llm().model();
-        if (model != null && !model.isBlank() && !"glm-5".equals(model)) {
+        if (model != null && !model.isBlank() && !"glm-5.2".equals(model)) {
             command.add("--model");
             command.add(model);
         }

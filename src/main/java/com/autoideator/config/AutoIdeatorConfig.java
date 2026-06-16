@@ -66,7 +66,7 @@ public record AutoIdeatorConfig(
     ) {
         public static final LlmConfig DEFAULT = new LlmConfig(
             "opencode-cli",
-            "glm-5",
+            "glm-5.2",
             Duration.ofMinutes(5),
             OpenRouterConfig.DEFAULT,
             CliConfig.claudeDefault(),
@@ -134,10 +134,10 @@ public record AutoIdeatorConfig(
                 "claude",
                 null,
                 "https://api.z.ai/api/anthropic",
-                "glm-5",
+                "glm-5.2",
                 "glm-4.5-air",
                 "glm-4.7",
-                "glm-5",
+                "glm-5.2",
                 false,  // Require explicit opt-in for dangerouslySkipPermissions
                 new String[0]
             );

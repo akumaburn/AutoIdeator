@@ -390,7 +390,7 @@ autoideator {
   llm {
     # claude-cli, custom-claude-cli, opencode-cli, openrouter, mock
     backend = "opencode-cli"
-    model = "glm-5"
+    model = "glm-5.2"
 
     openrouter {
       api-key = ${?OPENROUTER_API_KEY}
@@ -401,7 +401,7 @@ autoideator {
       path = "claude"
       api-key = ${?ANTHROPIC_API_KEY}
       base-url = "https://api.z.ai/api/anthropic"
-      model = "glm-5"
+      model = "glm-5.2"
       # Disables the Claude CLI's permission prompts. Off by default — only
       # enable this inside the bubblewrap sandbox or a throwaway environment.
       dangerously-skip-permissions = false

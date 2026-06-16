@@ -143,8 +143,8 @@ class ConfigTest {
     void customClaudeCliToStringMustRedactApiKey() {
         String secret = "sk-ant-LIVE-TEST-KEY-DO-NOT-LEAK-abcdefghij";
         AutoIdeatorConfig.CustomClaudeCliConfig cfg = new AutoIdeatorConfig.CustomClaudeCliConfig(
-            "claude", secret, "https://api.z.ai/api/anthropic", "glm-5",
-            "glm-4.5-air", "glm-4.7", "glm-5", false, new String[0]);
+            "claude", secret, "https://api.z.ai/api/anthropic", "glm-5.2",
+            "glm-4.5-air", "glm-4.7", "glm-5.2", false, new String[0]);
 
         String s = cfg.toString();
 
@@ -153,7 +153,7 @@ class ConfigTest {
         // Surrounding fields stay readable
         assertThat(s).contains("path=claude");
         assertThat(s).contains("baseUrl=https://api.z.ai/api/anthropic");
-        assertThat(s).contains("model=glm-5");
+        assertThat(s).contains("model=glm-5.2");
     }
 
     @Test
@@ -171,7 +171,7 @@ class ConfigTest {
             AutoIdeatorConfig.CliConfig.opencodeDefault(),
             new AutoIdeatorConfig.CustomClaudeCliConfig(
                 "claude", cccSecret, "https://api.z.ai/api/anthropic",
-                "glm-5", "glm-4.5-air", "glm-4.7", "glm-5", false, new String[0])
+                "glm-5.2", "glm-4.5-air", "glm-4.7", "glm-5.2", false, new String[0])
         );
 
         String s = llm.toString();

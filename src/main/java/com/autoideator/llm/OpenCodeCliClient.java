@@ -348,11 +348,11 @@ public class OpenCodeCliClient implements LlmInterface {
         command.add(config.llm().opencodeCli().path());
         command.add("run");  // OpenCode uses 'run' subcommand
 
-        // Add model - use zai-coding-plan/glm-5 default if not specified
+        // Add model - use zai-coding-plan/glm-5.2 default if not specified
         String model = config.llm().model();
         if (model == null || model.isBlank()) {
-            // Default to zai-coding-plan/glm-5 which works reliably
-            model = "zai-coding-plan/glm-5";
+            // Default to zai-coding-plan/glm-5.2 which works reliably
+            model = "zai-coding-plan/glm-5.2";
         } else if (!model.contains("/")) {
             // If model doesn't have provider prefix, assume zai-coding-plan
             model = "zai-coding-plan/" + model;

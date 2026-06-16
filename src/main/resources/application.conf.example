@@ -5,8 +5,8 @@ autoideator {
     backend = "opencode-cli"
 
     # Model selection (backend-specific)
-    # For opencode-cli: glm-5 (default), or any model from zai-coding-plan/*
-    model = "glm-5"
+    # For opencode-cli: glm-5.2 (default), or any model from zai-coding-plan/*
+    model = "glm-5.2"
 
     # Timeout for LLM responses
     timeout = 300s
@@ -37,13 +37,13 @@ autoideator {
       # Override base URL (ANTHROPIC_BASE_URL env var)
       base-url = "https://api.z.ai/api/anthropic"
       # Override model (ANTHROPIC_MODEL env var + --model flag)
-      model = "glm-5"
+      model = "glm-5.2"
       # Override haiku model (ANTHROPIC_DEFAULT_HAIKU_MODEL env var)
       haiku-model = "glm-4.5-air"
       # Override sonnet model (ANTHROPIC_DEFAULT_SONNET_MODEL env var)
       sonnet-model = "glm-4.7"
       # Override opus model (ANTHROPIC_DEFAULT_OPUS_MODEL env var)
-      opus-model = "glm-5"
+      opus-model = "glm-5.2"
       # Add --dangerously-skip-permissions to the spawned Claude CLI invocation.
       # WARNING: this disables the CLI's permission prompts so file-edit and
       # command-execution tool calls run without confirmation. Only enable this
