@@ -13,7 +13,9 @@ import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentLinkedDeque;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -42,10 +44,23 @@ public class EventBroadcaster {
     private static final int MAX_AGENT_OUTPUT_HISTORY = 100;
     private static final int MAX_RETRY_ATTEMPTS_PER_AGENT = 50;
 
+    /** Max queued outbound messages per WebSocket client before the slow client is dropped. */
+    private static final int MAX_CLIENT_SEND_QUEUE = 1000;
+
     // Eager singleton - thread-safe by JVM class loading guarantees
     private static final EventBroadcaster INSTANCE = new EventBroadcaster();
 
     private final List<WsContext> clients = new CopyOnWriteArrayList<>();
+
+    /**
+     * Per-session outbound send channels. Jetty permits only one in-flight write per
+     * WebSocket session, so concurrent blocking sends to the same session throw
+     * WritePendingException and previously caused healthy clients to be dropped.
+     * Each client gets a single-thread channel that serializes its sends and decouples
+     * a slow client from the broadcasting thread and from other clients.
+     */
+    private final Map<WsContext, ClientChannel> channels = new ConcurrentHashMap<>();
+
     private final Map<String, AgentState> agentStates = new ConcurrentHashMap<>();
 
     /**
@@ -369,6 +384,9 @@ public class EventBroadcaster {
     }
 
     public void addClient(WsContext client) {
+        // Register the send channel before adding to the broadcast list so any
+        // concurrent broadcast that sees this client always finds a channel.
+        channels.put(client, new ClientChannel(client));
         clients.add(client);
         LOG.debug("WebSocket client connected. Total clients: {}", clients.size());
 
@@ -378,7 +396,68 @@ public class EventBroadcaster {
 
     public void removeClient(WsContext client) {
         clients.remove(client);
+        ClientChannel channel = channels.remove(client);
+        if (channel != null) {
+            channel.shutdown();
+        }
         LOG.debug("WebSocket client disconnected. Total clients: {}", clients.size());
+    }
+
+    /**
+     * Per-session outbound channel: a single-thread executor that serializes the
+     * blocking WebSocket sends for one client. Submission is non-blocking, so one
+     * slow client cannot stall the broadcasting thread or starve other clients.
+     * If a client's backlog exceeds {@link #MAX_CLIENT_SEND_QUEUE}, the client is
+     * dropped. A send failure (closed/broken session) also drops the client.
+     */
+    private final class ClientChannel {
+        private final WsContext client;
+        private final ExecutorService executor;
+        private final AtomicInteger queued = new AtomicInteger(0);
+
+        ClientChannel(WsContext client) {
+            this.client = client;
+            this.executor = Executors.newSingleThreadExecutor(r -> {
+                Thread t = new Thread(r, "ws-send");
+                t.setDaemon(true);
+                return t;
+            });
+        }
+
+        void submit(String serialized) {
+            if (queued.get() >= MAX_CLIENT_SEND_QUEUE) {
+                LOG.warn("WebSocket client send backlog exceeded {}; dropping slow client", MAX_CLIENT_SEND_QUEUE);
+                removeClient(client);
+                return;
+            }
+            queued.incrementAndGet();
+            try {
+                executor.execute(() -> {
+                    queued.decrementAndGet();
+                    try {
+                        client.send(serialized);
+                    } catch (Throwable t) {
+                        LOG.warn("Error sending to WebSocket client, removing: {}", t.getMessage());
+                        removeClient(client);
+                    }
+                });
+            } catch (RejectedExecutionException e) {
+                // Channel already shut down (client removed) — drop silently.
+                queued.decrementAndGet();
+            }
+        }
+
+        void shutdown() {
+            executor.shutdownNow();
+        }
+    }
+
+    /** Enqueue a pre-serialized message to a client's serialized send channel (non-blocking). */
+    private void enqueueSend(WsContext client, String serialized) {
+        ClientChannel channel = channels.get(client);
+        if (channel != null) {
+            channel.submit(serialized);
+        }
     }
 
     private void sendInitialState(WsContext client) {
@@ -406,10 +485,14 @@ public class EventBroadcaster {
             // Send agent states
             sendToClient(client, "agent-states", Map.of("agents", new HashMap<>(agentStates)));
 
-            // Send recent events
+            // Send recent events — snapshot under the lock, then send outside it so a
+            // client's send work never holds the recentEvents monitor (which would
+            // otherwise stall event recording on the orchestration thread).
+            List<AgentEvent> eventsSnapshot;
             synchronized (recentEvents) {
-                sendToClient(client, "event-history", Map.of("events", new ArrayList<>(recentEvents)));
+                eventsSnapshot = new ArrayList<>(recentEvents);
             }
+            sendToClient(client, "event-history", Map.of("events", eventsSnapshot));
 
             // Send current cycle count
             sendToClient(client, "cycle-complete", Map.of("cycle", cycle));
@@ -424,7 +507,7 @@ public class EventBroadcaster {
     public void sendToClient(WsContext client, String eventType, Object data) {
         try {
             Map<String, Object> message = Map.of("type", eventType, "payload", data);
-            client.send(MAPPER.writeValueAsString(message));
+            enqueueSend(client, MAPPER.writeValueAsString(message));
         } catch (JsonProcessingException e) {
             LOG.warn("Error serializing message for client: {}", e.getMessage());
         }
@@ -605,17 +688,12 @@ public class EventBroadcaster {
             return;
         }
 
-        List<WsContext> deadClients = new ArrayList<>();
+        // Non-blocking: hand each client's serialized message to its own send channel.
+        // A slow or dead client only backs up (or drops) its own channel; it never
+        // blocks this loop or other clients. Dead-client removal is handled by the
+        // channel when its send fails.
         for (WsContext client : clients) {
-            try {
-                client.send(serialized);
-            } catch (Exception e) {
-                LOG.warn("Error broadcasting to client, removing: {}", e.getMessage());
-                deadClients.add(client);
-            }
-        }
-        if (!deadClients.isEmpty()) {
-            clients.removeAll(deadClients);
+            enqueueSend(client, serialized);
         }
     }
 

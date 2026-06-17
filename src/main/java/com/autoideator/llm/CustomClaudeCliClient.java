@@ -153,13 +153,6 @@ public class CustomClaudeCliClient implements LlmInterface {
             process = pb.start();
             ProcessManager.getInstance().register(process);
 
-            // Write prompt via stdin
-            try (var os = process.getOutputStream()) {
-                os.write(prompt.getBytes(StandardCharsets.UTF_8));
-                os.write('\n');
-                os.flush();
-            }
-
             final Process finalProcess = process;
             StringBuffer outputBuilder = new StringBuffer();
             StringBuffer errorBuilder = new StringBuffer();
@@ -205,6 +198,8 @@ public class CustomClaudeCliClient implements LlmInterface {
                     }
                 } catch (IOException e) {
                     LOG.debug("Error reading stdout: {}", e.getMessage());
+                } catch (Throwable t) {
+                    LOG.warn("Unexpected error in stdout reader thread: {}", t.toString(), t);
                 }
             });
 
@@ -219,6 +214,25 @@ public class CustomClaudeCliClient implements LlmInterface {
                     }
                 } catch (IOException e) {
                     LOG.debug("Error reading stderr: {}", e.getMessage());
+                } catch (Throwable t) {
+                    LOG.warn("Unexpected error in stderr reader thread: {}", t.toString(), t);
+                }
+            });
+
+            // Write the prompt to stdin on a dedicated thread, AFTER the reader threads
+            // are already draining stdout/stderr. Writing the prompt before the readers
+            // start risks a pipe-buffer deadlock: a prompt larger than the OS stdin
+            // buffer (~64 KB) blocks the writer, while the child simultaneously blocks
+            // writing stdout/stderr that nothing is draining yet.
+            Thread stdinThread = Thread.startVirtualThread(() -> {
+                try (var os = finalProcess.getOutputStream()) {
+                    os.write(prompt.getBytes(StandardCharsets.UTF_8));
+                    os.write('\n');
+                    os.flush();
+                } catch (IOException e) {
+                    LOG.debug("Error writing prompt to stdin: {}", e.getMessage());
+                } catch (Throwable t) {
+                    LOG.warn("Unexpected error writing prompt to stdin: {}", t.toString(), t);
                 }
             });
 

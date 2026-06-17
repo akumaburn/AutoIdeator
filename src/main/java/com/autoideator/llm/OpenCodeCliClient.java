@@ -179,12 +179,7 @@ public class OpenCodeCliClient implements LlmInterface {
             process = pb.start();
             ProcessManager.getInstance().register(process);
 
-            // Write prompt to stdin
-            String fullPrompt = buildFullPrompt(systemPrompt, userPrompt);
-            try (PrintWriter writer = new PrintWriter(new OutputStreamWriter(process.getOutputStream(), StandardCharsets.UTF_8), true)) {
-                writer.println(fullPrompt);
-            }
-
+            final String fullPrompt = buildFullPrompt(systemPrompt, userPrompt);
             final Process finalProcess = process;
             StringBuffer outputBuilder = new StringBuffer();
             StringBuffer errorBuilder = new StringBuffer();
@@ -208,6 +203,8 @@ public class OpenCodeCliClient implements LlmInterface {
                     }
                 } catch (IOException e) {
                     LOG.debug("Error reading output: {}", e.getMessage());
+                } catch (Throwable t) {
+                    LOG.warn("Unexpected error in stdout reader thread: {}", t.toString(), t);
                 }
             });
 
@@ -222,6 +219,22 @@ public class OpenCodeCliClient implements LlmInterface {
                     }
                 } catch (IOException e) {
                     LOG.debug("Error reading stderr: {}", e.getMessage());
+                } catch (Throwable t) {
+                    LOG.warn("Unexpected error in stderr reader thread: {}", t.toString(), t);
+                }
+            });
+
+            // Write the prompt to stdin on a dedicated thread, AFTER the reader threads
+            // are already draining stdout/stderr. Writing the prompt before the readers
+            // start risks a pipe-buffer deadlock: a prompt larger than the OS stdin
+            // buffer (~64 KB) blocks the writer, while the child simultaneously blocks
+            // writing stdout/stderr that nothing is draining yet.
+            Thread stdinThread = Thread.startVirtualThread(() -> {
+                try (PrintWriter writer = new PrintWriter(
+                        new OutputStreamWriter(finalProcess.getOutputStream(), StandardCharsets.UTF_8), true)) {
+                    writer.println(fullPrompt);
+                } catch (Throwable t) {
+                    LOG.warn("Unexpected error writing prompt to stdin: {}", t.toString(), t);
                 }
             });
 

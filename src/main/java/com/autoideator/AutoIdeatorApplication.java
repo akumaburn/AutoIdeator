@@ -40,6 +40,9 @@ public class AutoIdeatorApplication implements Callable<Integer> {
 
     private static final Logger LOG = LoggerFactory.getLogger(AutoIdeatorApplication.class);
 
+    /** Maximum time a shutdown hook may spend on cooperative cleanup before the JVM is force-halted. */
+    private static final long SHUTDOWN_GRACE_MILLIS = 20_000;
+
     @Option(
         names = {"--idea", "-i"},
         description = "Detailed description of the finished project (what done looks like — features, behavior, output, UX). Do not include implementation steps or phases.",
@@ -104,8 +107,37 @@ public class AutoIdeatorApplication implements Callable<Integer> {
     private String workingDir;
 
     public static void main(String[] args) {
+        Thread.setDefaultUncaughtExceptionHandler((thread, throwable) -> {
+            LOG.error("Uncaught exception in thread '{}': {}", thread.getName(), throwable.getMessage(), throwable);
+        });
         int exitCode = new CommandLine(new AutoIdeatorApplication()).execute(args);
         System.exit(exitCode);
+    }
+
+    /**
+     * Run cooperative shutdown cleanup with a hard upper bound. If {@code cleanup}
+     * does not finish within {@link #SHUTDOWN_GRACE_MILLIS}, a watchdog forcibly
+     * halts the JVM so a wedged agent future or subprocess cannot make Ctrl+C / exit
+     * hang forever. The watchdog is interrupted (and thus does nothing) when cleanup
+     * completes in time.
+     */
+    private static void runShutdownWithWatchdog(Runnable cleanup) {
+        Thread watchdog = new Thread(() -> {
+            try {
+                Thread.sleep(SHUTDOWN_GRACE_MILLIS);
+                LOG.warn("Shutdown cleanup exceeded {} ms; forcing JVM halt", SHUTDOWN_GRACE_MILLIS);
+                Runtime.getRuntime().halt(130);
+            } catch (InterruptedException ignored) {
+                // cleanup completed in time — nothing to do
+            }
+        }, "Shutdown-Watchdog");
+        watchdog.setDaemon(true);
+        watchdog.start();
+        try {
+            cleanup.run();
+        } finally {
+            watchdog.interrupt();
+        }
     }
 
     @Override
@@ -167,8 +199,10 @@ public class AutoIdeatorApplication implements Callable<Integer> {
         // Add shutdown hook for graceful termination
         Thread shutdownHook = new Thread(() -> {
             LOG.info("Shutdown requested...");
-            orchestrator.stop();
-            orchestrator.shutdown();
+            runShutdownWithWatchdog(() -> {
+                orchestrator.stop();
+                orchestrator.shutdown();
+            });
         });
         Runtime.getRuntime().addShutdownHook(shutdownHook);
 
@@ -211,8 +245,10 @@ public class AutoIdeatorApplication implements Callable<Integer> {
         // Add shutdown hook for graceful termination
         Thread shutdownHook = new Thread(() -> {
             LOG.info("Shutdown requested...");
-            orchestrator.stop();
-            orchestrator.shutdown();
+            runShutdownWithWatchdog(() -> {
+                orchestrator.stop();
+                orchestrator.shutdown();
+            });
         });
         Runtime.getRuntime().addShutdownHook(shutdownHook);
 
