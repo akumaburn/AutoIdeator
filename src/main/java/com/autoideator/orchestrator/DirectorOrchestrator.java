@@ -1770,7 +1770,8 @@ public class DirectorOrchestrator {
                         return new FeatureCheckResult(featureFinal, false,
                             "FAIL: " + featureFinal.title() + "\nWhat: Verification agent failed\n"
                             + "Why: Could not verify this feature\n"
-                            + "Fix: Manual inspection required — agent error: " + resp.error());
+                            + "Fix: Manual inspection required — agent error: " + resp.error()
+                            + "\nVERDICT: FAIL");
                     }
 
                     // Search the first few lines for PASS:/FAIL: verdict — LLMs sometimes
@@ -1811,29 +1812,78 @@ public class DirectorOrchestrator {
     }
 
     /**
-     * Parse the feature inventory output into structured items.
-     *
-     * <p>Expects lines starting with {@code FEATURE N:} followed by Description and Location lines.
-     */
-    /**
      * Detect whether a feature verification response is a PASS or FAIL.
-     * Searches the first 10 lines for a line starting with "PASS:" or "FAIL:"
-     * (case-insensitive) to handle LLM preamble before the verdict.
-     * If "PASS:" is found before "FAIL:", returns true. Otherwise false.
+     *
+     * <p>The authoritative signal is a machine-readable {@code VERDICT: PASS|FAIL} line,
+     * which the {@code FEATURE_CHECK} prompt requires as the final line of output. We scan
+     * from the END so that verbose preamble, "thinking out loud", or a cross-feature
+     * summary cannot shadow the real conclusion — the failure mode that caused genuine
+     * PASSes to be misclassified as FAIL and routed to remediation Coders.
+     *
+     * <p>Fallbacks for non-conforming output, in order:
+     * <ol>
+     *   <li>The last {@code VERDICT:} line (scanned from the end).</li>
+     *   <li>The last verdict-style {@code PASS:}/{@code FAIL:} header — the conclusion
+     *       wins over any earlier preamble.</li>
+     *   <li>If no verdict marker exists at all, treat as FAIL — the feature could not be
+     *       confirmed to work.</li>
+     * </ol>
      */
     private boolean detectPassVerdict(String content) {
         if (content == null || content.isBlank()) return false;
         String[] lines = content.split("\n");
-        int linesToCheck = Math.min(lines.length, 10);
-        for (int i = 0; i < linesToCheck; i++) {
-            String trimmed = lines[i].trim().toUpperCase();
-            if (trimmed.startsWith("PASS:")) return true;
-            if (trimmed.startsWith("FAIL:")) return false;
+
+        // 1. Authoritative: explicit "VERDICT: PASS|FAIL", scanned from the end so the
+        //    final conclusion wins over any earlier preamble or summary line.
+        for (int i = lines.length - 1; i >= 0; i--) {
+            String trimmed = stripLeadingMarkdown(lines[i]).toUpperCase();
+            if (trimmed.startsWith("VERDICT:")) {
+                String verdict = trimmed.substring("VERDICT:".length()).trim();
+                if (verdict.startsWith("PASS")) return true;
+                if (verdict.startsWith("FAIL")) return false;
+                // Unrecognized value — keep scanning earlier lines for a valid marker.
+            }
         }
-        // No explicit verdict found — treat as FAIL (safer to verify than to skip)
+
+        // 2. Fallback: no VERDICT: marker present. Use the LAST verdict-style header, since
+        //    the real verdict is the conclusion at the bottom, not any preamble at the top.
+        for (int i = lines.length - 1; i >= 0; i--) {
+            String trimmed = stripLeadingMarkdown(lines[i]).toUpperCase();
+            if (trimmed.startsWith("PASS:")) {
+                LOG.warn("Feature verdict parsed from trailing 'PASS:' header — no explicit VERDICT: marker present");
+                return true;
+            }
+            if (trimmed.startsWith("FAIL:")) {
+                LOG.warn("Feature verdict parsed from trailing 'FAIL:' header — no explicit VERDICT: marker present");
+                return false;
+            }
+        }
+
+        // 3. No verdict marker anywhere — cannot confirm the feature works.
+        LOG.warn("No VERDICT/PASS/FAIL marker found in feature check output — defaulting to FAIL");
         return false;
     }
 
+    /**
+     * Strips leading markdown decoration (heading {@code #}, bullet {@code -}/{@code *},
+     * emphasis {@code *}/{@code _}, blockquote {@code >}) and surrounding whitespace from a
+     * line, so verdict markers like {@code **VERDICT: PASS**} or {@code ## FAIL:} are still
+     * recognized.
+     */
+    private static String stripLeadingMarkdown(String line) {
+        String s = line.trim();
+        int start = 0;
+        while (start < s.length() && "#*->_ \t".indexOf(s.charAt(start)) >= 0) {
+            start++;
+        }
+        return s.substring(start).trim();
+    }
+
+    /**
+     * Parse the feature inventory output into structured items.
+     *
+     * <p>Expects lines starting with {@code FEATURE N:} followed by Description and Location lines.
+     */
     private List<FeatureItem> parseFeatureInventory(String inventoryOutput) {
         if (inventoryOutput == null || inventoryOutput.isBlank()) return List.of();
 
