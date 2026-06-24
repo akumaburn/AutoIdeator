@@ -1,5 +1,6 @@
 package com.autoideator.orchestrator;
 
+import com.autoideator.ProcessManager;
 import com.autoideator.agent.*;
 import com.autoideator.checkpoint.OrchestrationCheckpoint;
 import com.autoideator.config.AutoIdeatorConfig;
@@ -81,6 +82,11 @@ public class DirectorOrchestrator {
     private static final int MAX_ERROR_COUNT_BEFORE_BACKOFF = 3;
     private static final long MAX_BACKOFF_DELAY_MS = 60000;
     private static final int MAX_CYCLE_HISTORY = 100;
+    // Fallback LLM call timeout when config leaves it unset (matches CLI clients' 300s default).
+    private static final long DEFAULT_LLM_TIMEOUT_MS = 300_000;
+    // Extra margin added to an LLM call timeout before a replaced LLM client is closed,
+    // covering subprocess teardown (destroyForcibly + waitForProcessDeath + reader-thread joins).
+    private static final long LLM_CLOSE_GRACE_MARGIN_MS = 30_000;
     // Synthesizer interval is read from config.orchestration().synthesizeInterval()
 
     private volatile AutoIdeatorConfig config;
@@ -90,6 +96,9 @@ public class DirectorOrchestrator {
     private final AtomicReference<OrchestratorState> state;
     private final java.util.concurrent.locks.ReentrantLock pauseLock = new java.util.concurrent.locks.ReentrantLock();
     private final java.util.concurrent.locks.Condition resumeCondition = pauseLock.newCondition();
+    // Serializes checkpoint auto-save against checkpoint-saver changes (e.g. stop disabling
+    // the saver), so an in-progress save cannot resurrect a checkpoint the caller is about to clear.
+    private final Object checkpointLock = new Object();
 
     // Specialized agents
     private final OverseerAgent overseer;
@@ -519,13 +528,19 @@ public class DirectorOrchestrator {
         // point, cycleCount would still be N-1 and the incomplete cycle would be re-run.
         cycleCount.set(currentCycle);
 
-        // Auto-save checkpoint after each completed cycle
-        java.util.function.Consumer<OrchestrationCheckpoint> saver = this.checkpointSaver;
-        if (saver != null) {
-            try {
-                saver.accept(captureCheckpoint(idea));
-            } catch (Exception e) {
-                LOG.warn("Failed to save checkpoint after cycle {}: {}", currentCycle, e.getMessage());
+        // Auto-save checkpoint after each completed cycle.
+        // Held under checkpointLock so a concurrent stop (which nulls the saver before
+        // deleting the checkpoint file) cannot interleave between the null-check and the
+        // write — otherwise a save completing just after the delete would resurrect the
+        // checkpoint the user explicitly cleared.
+        synchronized (checkpointLock) {
+            java.util.function.Consumer<OrchestrationCheckpoint> saver = this.checkpointSaver;
+            if (saver != null) {
+                try {
+                    saver.accept(captureCheckpoint(idea));
+                } catch (Exception e) {
+                    LOG.warn("Failed to save checkpoint after cycle {}: {}", currentCycle, e.getMessage());
+                }
             }
         }
     }
@@ -2759,6 +2774,13 @@ public class DirectorOrchestrator {
                 pauseLock.unlock();
             }
         }
+        // Kill in-flight CLI subprocesses so any agent call currently blocked in
+        // CompletableFuture.join() returns promptly. join() is uninterruptible and the
+        // call runs to its own (multi-minute) timeout on the LLM client's executor, so
+        // without this stop() would only take effect at the next checkAndPause gate —
+        // after the current call finishes naturally. Killing the process makes the
+        // client's wait return, the future complete, and the loop unwind in ~1s.
+        ProcessManager.getInstance().killAll();
     }
 
     /**
@@ -2843,8 +2865,9 @@ public class DirectorOrchestrator {
         if (s != OrchestratorState.PAUSED && s != OrchestratorState.PAUSING) {
             throw new IllegalStateException("Config can only be hot-applied while paused");
         }
-        boolean backendChanged = !newConfig.llm().backend().equals(config.llm().backend());
-        boolean modelChanged = !newConfig.llm().model().equals(config.llm().model());
+        AutoIdeatorConfig oldConfig = this.config;
+        boolean backendChanged = !newConfig.llm().backend().equals(oldConfig.llm().backend());
+        boolean modelChanged = !newConfig.llm().model().equals(oldConfig.llm().model());
 
         // Update config — all subsequent reads of this.config see the new value
         this.config = newConfig;
@@ -2855,11 +2878,46 @@ public class DirectorOrchestrator {
                 newConfig.llm().backend(), newConfig.llm().model());
             LlmInterface oldLlm = this.llm;
             this.llm = LlmInterface.create(newConfig);
-            try { oldLlm.close(); } catch (Exception e) { LOG.warn("Error closing old LLM", e); }
+            // Defer closing the old client: a hot-apply can land while the orchestrator is
+            // PAUSING (an agent call still in flight) or PAUSED-during-coder-phase (some
+            // coders still mid-call). Those calls hold the old client via their captured
+            // context; closing it now would shut its executor down underneath them.
+            scheduleOldLlmClose(oldLlm, oldConfig);
         }
 
         ideaQueue.rebuildWeights(newConfig.orchestration().ideaQueueWeights());
         LOG.info("Applied config updates while paused");
+    }
+
+    /**
+     * Close an LLM client that has been replaced by {@link #applyConfig}, on a background
+     * thread, only once any agent call still using it is guaranteed to have ended.
+     * <p>
+     * An in-flight call holds the old client through its captured {@code ExecutionContext};
+     * the call is bounded by the old config's LLM timeout, after which the client's own
+     * teardown (destroyForcibly + reader-thread joins) runs. We wait that bound plus a
+     * margin before closing, so we neither disrupt the running call nor leak the client's
+     * executor threads. New attempts after resume use the freshly created client, so the
+     * old client has no users once the in-flight call returns.
+     */
+    private void scheduleOldLlmClose(LlmInterface oldLlm, AutoIdeatorConfig oldConfig) {
+        long timeoutMs = oldConfig.llm().timeout() != null
+            ? oldConfig.llm().timeout().toMillis() : DEFAULT_LLM_TIMEOUT_MS;
+        long graceMs = timeoutMs + LLM_CLOSE_GRACE_MARGIN_MS;
+        Thread.ofVirtual().name("llm-close-deferred").start(() -> {
+            try {
+                Thread.sleep(graceMs);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                // Fall through and close anyway — the JVM is likely shutting down.
+            }
+            try {
+                oldLlm.close();
+                LOG.info("Closed replaced LLM client after {}ms grace", graceMs);
+            } catch (Exception e) {
+                LOG.warn("Error closing replaced LLM client: {}", e.getMessage());
+            }
+        });
     }
 
     /**
@@ -2889,7 +2947,12 @@ public class DirectorOrchestrator {
      * @param saver the checkpoint consumer, or null to disable auto-save
      */
     public void setCheckpointSaver(java.util.function.Consumer<OrchestrationCheckpoint> saver) {
-        this.checkpointSaver = saver;
+        // Under checkpointLock: setting the saver to null (e.g. on stop) blocks until any
+        // in-progress auto-save finishes, so the caller can safely delete the checkpoint
+        // afterwards without an in-flight save racing past the deletion.
+        synchronized (checkpointLock) {
+            this.checkpointSaver = saver;
+        }
     }
 
     /**
